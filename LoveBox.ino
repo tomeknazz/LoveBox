@@ -7,19 +7,29 @@
 #include <HTTPClient.h>
 #include <time.h>
 #include <Preferences.h>
+#include <SPI.h>
 
-const char* ssid = "YOUR SSID"; 
-const char* password = "YOUR PASSWORD";
-#define BOTtoken "YOUR TELEGRAM BOT TOKEN"
-#define CHAT_ID "YOUR USER ID ON TELEGRAM"
+String current_ssid = "YOUR_SSID"; 
+String current_password = "YOUR_PASSWORD";
 
-String owm_key = "OPENWEATHER API KEY"; 
+int wifiSetupState = 0; 
+String tempSSID = "";
 
-#define CS_PIN 5
-#define DC_PIN 17
-#define RES_PIN 16
-#define BUSY_PIN 4
-//I'M USING WEACT WHITE-BLACK-RED 4.2 E-INK DISPLAY FROM ALIEXPRESS
+#define BOTtoken "YOUR_BOT_TOKEN"
+#define CHAT_ID_BF "YOUR_CHAT_ID"
+String CHAT_ID_GF = "";
+
+String owm_key = "WEATHER_API_KEY"; 
+
+#define TOUCH_PIN 4
+#define SCK_PIN   5
+#define MOSI_PIN  6
+#define CS_PIN    7
+#define DC_PIN    8
+#define RES_PIN   9
+#define BUSY_PIN  10
+
+//I'M USING WEACT STUDIO WHITE-BLACK-RED 4.2 E-INK DISPLAY FROM ALIEXPRESS
 //FOR HARDWARE SETUP TROUBLESHOOTING PLEASE REFER TO THEIR GITHUB
 GxEPD2_3C<GxEPD2_420c_GDEY042Z98, GxEPD2_420c_GDEY042Z98::HEIGHT> display(GxEPD2_420c_GDEY042Z98(CS_PIN, DC_PIN, RES_PIN, BUSY_PIN));
 U8G2_FOR_ADAFRUIT_GFX u8g2Fonts;
@@ -28,9 +38,17 @@ WiFiClientSecure client;
 UniversalTelegramBot bot(BOTtoken, client);
 Preferences settings; 
 
+// DEEP SLEEP CONFIG
+unsigned long lastActivityTime = 0; 
+const unsigned long SLEEP_TIMEOUT = 60000;
+const uint64_t WAKEUP_INTERVAL_MINUTES = 30;
+
 unsigned long lastTimeBotRan;
 unsigned long lastMessage;
 const unsigned long botCheckDelay = 1000; 
+
+unsigned long lastTouchTime = 0; 
+const unsigned long touchCooldown = 30000; 
 
 //DEFAULT VALUES - PLEASE CHANGE ACCORDINGLY
 String lastNormalMessage = "Czekam na wiadomosc...";
@@ -114,7 +132,8 @@ GreetingPair morningPool[] = {
   {"Czas wstać,", "Piękności! :)"}, {"Uśmiechnij się,", "Skarbie! :*"},
   {"Kawa zrobiona,", "Kochanie?"}, {"Dobrego dnia,", "Moja Miłości! <3"},
   {"Poranne buziaki", "dla Ciebie! :*"}, {"Zacznij dzień", "z uśmiechem! :)"},
-  {"Meow meow meow","meow meow! (=^o^=)"}, {"A kto rano wstaje","temu kot mruczy (=^w^=)"}
+  {"Meow meow meow","meow meow! (=^o^=)"}, {"A kto rano wstaje","temu kot mruczy (=^w^=)"},
+  {"Elo","żelo!"}
 };
 
 GreetingPair afternoonPool[] = {
@@ -147,9 +166,20 @@ long calculateDaysTogether(tm timeinfo) {
   anniv.tm_year = annivYear - 1900; 
   anniv.tm_mon = annivMonth - 1; 
   anniv.tm_mday = annivDay;
-  time_t now = mktime(&timeinfo); 
+  anniv.tm_hour = 0; 
+  anniv.tm_min = 0; 
+  anniv.tm_sec = 0;
+
+  struct tm today = timeinfo;
+  today.tm_hour = 0; 
+  today.tm_min = 0; 
+  today.tm_sec = 0;
+
+  time_t now = mktime(&today); 
   time_t start = mktime(&anniv);
-  return (long)(difftime(now, start) / 86400.0);
+  
+  // +0.5 FOR TIME CHANGE
+  return (long)((difftime(now, start) / 86400.0) + 0.5);
 }
 
 long calculateCountdown(tm timeinfo) {
@@ -157,9 +187,19 @@ long calculateCountdown(tm timeinfo) {
   target.tm_year = countYear - 1900; 
   target.tm_mon = countMonth - 1; 
   target.tm_mday = countDay;
-  time_t now = mktime(&timeinfo); 
+  target.tm_hour = 0; 
+  target.tm_min = 0; 
+  target.tm_sec = 0;
+
+  struct tm today = timeinfo;
+  today.tm_hour = 0; 
+  today.tm_min = 0; 
+  today.tm_sec = 0;
+
+  time_t now = mktime(&today); 
   time_t future = mktime(&target);
-  return (long)(difftime(future, now) / 86400.0);
+  
+  return (long)((difftime(future, now) / 86400.0) + 0.5);
 }
 //FETCHING TIME USING NTP
 void fetchTime() {
@@ -209,7 +249,7 @@ WeatherData fetchWeather(String queryCity) {
   }
   return data;
 }
-//AUX FUNCTION FOR WARPING TEXT TO AVOID CLIPPING
+// TEXT WRAPPING TO AVOID CLIPPING
 void printWordWrapped(String text, int x, int y, int maxWidth) {
   int currentY = y;
   int lineHeight = u8g2Fonts.getFontAscent() - u8g2Fonts.getFontDescent() + 4;
@@ -244,7 +284,19 @@ void printWordWrapped(String text, int x, int y, int maxWidth) {
 
 // MAIN FUNCTION TO REFRESH SCREEN
 void showOnScreen(String messageText) {
-  fetchTime();    
+  fetchTime();   
+
+  time_t now;
+  time(&now);
+  long lastCharge = settings.getLong("last_charge", (long)now); // Domyślnie "teraz", jeśli brak w pamięci
+  int daysSinceCharge = (now - lastCharge) / 86400; // 86400 to ilość sekund w dobie
+
+  bool needsCharging = (daysSinceCharge >= 40);
+  if (needsCharging) {
+     bot.sendMessage(CHAT_ID_BF, "⚠️ Mój poziom energii spada! Podłącz mnie do ładowania i wpisz /naladowano.", "");
+     if (CHAT_ID_GF != "") bot.sendMessage(CHAT_ID_GF, "⚠️ Mój poziom energii spada! Podłącz mnie do ładowania i wpisz /naladowano.", "");
+
+  } 
   
   WeatherData pogoda1; 
   WeatherData pogoda2;
@@ -368,7 +420,7 @@ void showOnScreen(String messageText) {
       u8g2Fonts.setFont(u8g2_font_helvB14_te); 
       u8g2Fonts.setCursor(rightX, 120); 
       if(city2_name == "Gdynia") u8g2Fonts.print("Pogoda u Tomka:");
-      else u8g2Fonts.print(city2_name + ":"); // Dynamiczna nazwa!
+      else u8g2Fonts.print(city2_name + ":");
       u8g2Fonts.setForegroundColor(GxEPD_BLACK); 
       u8g2Fonts.setFont(u8g2_font_helvB24_te); 
       u8g2Fonts.setCursor(rightX, 150); 
@@ -378,9 +430,22 @@ void showOnScreen(String messageText) {
       u8g2Fonts.setFont(u8g2_font_open_iconic_weather_4x_t); 
       u8g2Fonts.setCursor(rightX+120, 160); 
       u8g2Fonts.print(pogoda2.icon);
+      // MINIMIZED COUNTDOWN
+      if (display.epd2.hasColor) u8g2Fonts.setForegroundColor(GxEPD_RED);
+      u8g2Fonts.setFont(u8g2_font_helvB12_te); 
+      u8g2Fonts.setCursor(rightX, 225); 
+      u8g2Fonts.print(countDesc + ":");
+      
+      u8g2Fonts.setForegroundColor(GxEPD_BLACK); 
+      u8g2Fonts.setFont(u8g2_font_helvB18_te); 
+      u8g2Fonts.setCursor(rightX, 250); 
+      if (daysLeftCountdown > 1) u8g2Fonts.print(String(daysLeftCountdown) + " dni");
+      else if (daysLeftCountdown == 1) u8g2Fonts.print(String(daysLeftCountdown) + " dzień");
+      else if (daysLeftCountdown == 0) u8g2Fonts.print("To już dzisiaj!");
+      else u8g2Fonts.print("Minęło!");
     } 
     else if (bottomWidget == 1) {
-      // MODE: KALENDARZ MIESIĘCZNY
+      // MODE: CALENDAR
       if (display.epd2.hasColor) u8g2Fonts.setForegroundColor(GxEPD_RED);
       u8g2Fonts.setFont(u8g2_font_helvB14_te); 
       u8g2Fonts.setCursor(rightX, 120); 
@@ -407,7 +472,7 @@ void showOnScreen(String messageText) {
       for(int d = 1; d <= getDaysInMonth(currentMonth, currentYear); d++) {
         int drawX = rightX + (col * 24);
         
-        // Czerwony box dla dzisiejszego dnia!
+        // RED BOX FOR TODAY
         if (d == currentDay) {
           if (display.epd2.hasColor) {
             display.fillRoundRect(drawX-1, currY-12, 18, 14, 2, GxEPD_RED);
@@ -422,7 +487,6 @@ void showOnScreen(String messageText) {
           u8g2Fonts.setForegroundColor(GxEPD_BLACK);
         }
         
-        // Równanie dla dni jednocyfrowych, żeby ładnie wyglądało w siatce
         if(d < 10) u8g2Fonts.setCursor(drawX + 3, currY);
         else u8g2Fonts.setCursor(drawX, currY);
         
@@ -432,28 +496,43 @@ void showOnScreen(String messageText) {
         col++;
         if(col > 6) { col = 0; currY += 18; }
       }
-      u8g2Fonts.setForegroundColor(GxEPD_BLACK); // Reset koloru
+      u8g2Fonts.setForegroundColor(GxEPD_BLACK);
+
+      // COMPACT MINIMIZED COUNTDOWN
+      if (display.epd2.hasColor) u8g2Fonts.setForegroundColor(GxEPD_RED);
+      else u8g2Fonts.setForegroundColor(GxEPD_BLACK);
+      
+      u8g2Fonts.setFont(u8g2_font_helvB10_te); 
+      u8g2Fonts.setCursor(rightX, 275); 
+      u8g2Fonts.print(countDesc + ":");
+      
+      u8g2Fonts.setForegroundColor(GxEPD_BLACK);
+      u8g2Fonts.setFont(u8g2_font_helvB14_te); 
+      u8g2Fonts.setCursor(rightX, 292); 
+      if (daysLeftCountdown > 1) u8g2Fonts.print(String(daysLeftCountdown) + " dni");
+      else if (daysLeftCountdown == 1) u8g2Fonts.print(String(daysLeftCountdown) + " dzień");
+      else if (daysLeftCountdown == 0) u8g2Fonts.print("To już dzisiaj!");
+      else u8g2Fonts.print("Minęło!");
     }
     else if (bottomWidget == 2) {
-      // TRYB: ODLICZANIE Z OPISEM
+      // MODE: FULL COUNTDOWN
       if (display.epd2.hasColor) u8g2Fonts.setForegroundColor(GxEPD_RED);
       u8g2Fonts.setFont(u8g2_font_helvB14_te); 
       u8g2Fonts.setCursor(rightX, 120); 
-      u8g2Fonts.print("Odliczamy do:");
+      u8g2Fonts.print("Odliczamy:");
       
       u8g2Fonts.setForegroundColor(GxEPD_BLACK);
       u8g2Fonts.setFont(u8g2_font_helvB24_te); 
       u8g2Fonts.setCursor(rightX, 155); 
       
-      if (daysLeftCountdown > 0) {
-        u8g2Fonts.print(String(daysLeftCountdown) + " dni");
-      } else if (daysLeftCountdown == 0) {
-        u8g2Fonts.print("To dzisiaj!");
+      if (daysLeftCountdown > 1) u8g2Fonts.print(String(daysLeftCountdown) + " dni");
+      else if (daysLeftCountdown == 1) u8g2Fonts.print(String(daysLeftCountdown) + " dzień");
+      else if (daysLeftCountdown == 0) {
+        u8g2Fonts.print("To już dzisiaj!");
       } else {
         u8g2Fonts.print("Minęło!");
       }
 
-      // Zawijanie opisu na dole
       u8g2Fonts.setFont(u8g2_font_helvR14_te); 
       printWordWrapped(countDesc, rightX, 185, 170);
     }
@@ -466,11 +545,20 @@ void showOnScreen(String messageText) {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(100);
+
+  pinMode(TOUCH_PIN, INPUT_PULLDOWN);
+
+  SPI.begin(SCK_PIN, -1, MOSI_PIN, CS_PIN);
+
+  lastActivityTime = millis();
 
   randomSeed(esp_random());
 
   settings.begin("lovebox", false);
+  CHAT_ID_GF = settings.getString("gf_id", CHAT_ID_BF);
+  current_ssid = settings.getString("wifi_ssid", current_ssid);
+  current_password = settings.getString("wifi_pass", current_password);
   lastNormalMessage = settings.getString("ostatni_tekst", "Czekam na wiadomosc..."); 
   annivYear = settings.getInt("anniv_y", 2024); 
   annivMonth = settings.getInt("anniv_m", 10); 
@@ -491,7 +579,7 @@ void setup() {
   countDesc = settings.getString("cDesc", "Wakacje!");
   
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin(current_ssid.c_str(), current_password.c_str());
 
   Serial.print("Łączenie z WiFi");
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
@@ -511,17 +599,106 @@ void setup() {
 }
 
 void loop() {
+  int touchState = digitalRead(TOUCH_PIN);
+  if (touchState == HIGH) {
+
+    if (millis() - lastTouchTime > touchCooldown) {
+      Serial.println("PRZYCISK DOTKNIĘTY! Rysuję ekran i nakładam blokadę na 6s.");
+      lastTouchTime = millis();
+
+      bot.sendMessage(CHAT_ID_BF, "Twoja dziewczyna właśnie o Tobie pomyślała!", "");
+
+      showOnScreen(lastNormalMessage); 
+    } else {
+      Serial.println("Ignoruję dotyk (Cooldown aktywny).");
+    }
+  }
+
+
   if (millis() > lastTimeBotRan + botCheckDelay)  {
     int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    
 
     while(numNewMessages) {
       for (int i=0; i<numNewMessages; i++) {
         String chat_id = String(bot.messages[i].chat_id);
         String received_text = bot.messages[i].text;
-        
-        if (chat_id == CHAT_ID) {
+
+        if (chat_id == CHAT_ID_BF){
+          if (received_text.startsWith("/dodaj_id ")) {
+            String newId = received_text.substring(10); newId.trim();
+            CHAT_ID_GF = newId; settings.putString("gf_id", CHAT_ID_GF);
+            bot.sendMessage(chat_id, "Dodano uprawnienia dla ID: " + CHAT_ID_GF, "");
+            bot.sendMessage(CHAT_ID_GF, "Zostalas dodana do systemu! Mozesz teraz sterowac LoveBoxem.", "");
+            continue;
+          }
+          else if (received_text == "/usun_id") {
+            CHAT_ID_GF = ""; settings.putString("gf_id", "");
+            bot.sendMessage(chat_id, "Usunieto dostep dla drugiego uzytkownika.", "");
+            continue;
+          }
           
-          if (received_text == "/pogoda1_wylacz") {
+        }
+        
+        if (chat_id == CHAT_ID_BF || (CHAT_ID_GF != "" && chat_id == CHAT_ID_GF)) {
+
+          if (received_text == "/anuluj" && wifiSetupState != 0) {
+            wifiSetupState = 0;
+            bot.sendMessage(chat_id, "Zmiana WiFi anulowana.", "");
+            continue;
+          }
+
+          if (wifiSetupState == 1) {
+            tempSSID = received_text;
+            wifiSetupState = 2;
+            bot.sendMessage(chat_id, "Podaj haslo dla sieci: " + tempSSID, "");
+            continue; 
+          } 
+          else if (wifiSetupState == 2) {
+            String tempPASS = received_text;
+            wifiSetupState = 0;
+            bot.sendMessage(chat_id, "Probuje polaczyc z " + tempSSID + "...", "");
+            
+            WiFi.disconnect();
+            delay(500);
+            WiFi.begin(tempSSID.c_str(), tempPASS.c_str());
+            
+            int attempts = 0;
+            while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+              delay(500);
+              attempts++;
+            }
+            
+            if (WiFi.status() == WL_CONNECTED) {
+              current_ssid = tempSSID;
+              current_password = tempPASS;
+              settings.putString("wifi_ssid", current_ssid);
+              settings.putString("wifi_pass", current_password);
+              bot.sendMessage(chat_id, "Polaczono pomyslnie z nowa siecia!", "");
+            } else {
+              WiFi.disconnect();
+              delay(500);
+              WiFi.begin(current_ssid.c_str(), current_password.c_str());
+              while (WiFi.status() != WL_CONNECTED) { delay(500); }
+              bot.sendMessage(chat_id, "Nie udalo sie polaczyc. Wrocono do poprzedniej sieci.", "");
+            }
+            continue;
+          }
+
+          if (received_text == "/wifi") {
+            wifiSetupState = 1;
+            bot.sendMessage(chat_id, "Podaj dokladna nazwe (SSID) nowej sieci WiFi (lub wpisz /anuluj):", "");
+          }
+
+          else if (received_text == "/naladowano") {
+            time_t now;
+            time(&now);
+            settings.putLong("last_charge", (long)now);
+            bot.sendMessage(chat_id, "Licznik baterii wyzerowany! LoveBox jest w pełni naładowany lub się ładuje.", "");
+            showOnScreen(lastNormalMessage);
+          }
+          
+          else if (received_text == "/pogoda1_wylacz") {
             showWeather1 = false; 
             settings.putBool("showW1", false); 
             bot.sendMessage(chat_id, "Pogoda (Góra) wyłączona!", "");
@@ -551,7 +728,6 @@ void loop() {
             bot.sendMessage(chat_id, "Widget Kalendarz ustawiony!", "");
             showOnScreen(lastNormalMessage);
           }
-          // --- NOWOŚĆ: POWRÓT DO ODLICZANIA ---
           else if (received_text == "/widget odliczanie") {
             bottomWidget = 2; 
             settings.putInt("botWid", 2); 
@@ -578,9 +754,7 @@ void loop() {
             showOnScreen(lastNormalMessage);
           }
 
-          // KOMENDA ODLICZANIA (Z OPISEM!)
           else if (received_text.startsWith("/odliczanie ")) {
-            // Skrypt wycina tekst: "/odliczanie YYYY-MM-DD Opis Twojego wydarzenia"
             String datePart = received_text.substring(12, 22);
             String descPart = received_text.substring(23);
             
@@ -593,7 +767,7 @@ void loop() {
               countMonth = m; 
               countDay = d; 
               countDesc = descPart;
-              bottomWidget = 2; // Automatycznie włącza widget odliczania!
+              bottomWidget = 2;
               
               settings.putInt("cY", y); 
               settings.putInt("cM", m); 
@@ -632,20 +806,39 @@ void loop() {
                 showOnScreen(lastNormalMessage); 
             } else { bot.sendMessage(chat_id, "Zły format! Użyj: /urodziny MM-DD", ""); }
           }
-          
-          else {
+          else if(chat_id == CHAT_ID_BF){
             Serial.println("Od Ciebie: " + received_text);
+            if(received_text == lastNormalMessage) continue;
             lastNormalMessage = received_text; 
             settings.putString("ostatni_tekst", lastNormalMessage); 
             showOnScreen(lastNormalMessage); 
             bot.sendMessage(chat_id, "Wiadomość wyświetlona na E-Ink!", "");
           }
+          else if (chat_id == CHAT_ID_GF){
+            bot.sendMessage(chat_id, "Tylko twój chłopak może ci coś wyświetlić na ekranie :)");
+          }
           
           lastMessage = millis();
-        } 
+        }
+        else {
+          bot.sendMessage(chat_id, "Brak dostepu! Twoj Chat ID to: " + chat_id + "\n\nPodaj ten numer administratorowi urzadzenia.", "");
+        }
+        
+
       }
       numNewMessages = bot.getUpdates(bot.last_message_received + 1);
     }
     lastTimeBotRan = millis();
   }
+
+  if (millis() - lastActivityTime > SLEEP_TIMEOUT) {
+    Serial.println("Brak aktywnosci przez 60 sekund. Przechodze w Deep Sleep.");
+    
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << TOUCH_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
+    
+    esp_sleep_enable_timer_wakeup(WAKEUP_INTERVAL_MINUTES * 60ULL * 1000000ULL);
+    
+    esp_deep_sleep_start();
+  }
+
 }
